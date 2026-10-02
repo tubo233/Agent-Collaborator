@@ -1,12 +1,25 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { test, type TestContext } from 'node:test';
+import { test as nodeTest, type TestContext } from 'node:test';
 import { DomainError, Store } from '../src/core/store.js';
 import type { Actor, Attempt, ClaimResult, Handoff, Project, Task } from '../src/shared/types.js';
+
+// TAP and stream writes can be buffered until synchronous tests yield. Keep these
+// phase markers synchronous so native Windows failures retain the last operation.
+function phase(message: string): void {
+  writeSync(2, `[core] ${message}\n`);
+}
+function test(name: string, body: (t: TestContext) => void) {
+  return nodeTest(name, (t) => {
+    phase(`START ${name}`);
+    body(t);
+    phase(`BODY COMPLETE ${name}`);
+  });
+}
 
 const human: Actor = { name: 'Reviewer', kind: 'human' };
 const agent: Actor = {
@@ -29,10 +42,18 @@ function fixture(t: TestContext) {
     stores.add(store);
     return store;
   };
+  phase(`fixture opening: ${t.name}`);
   const store = open();
+  phase(`fixture opened: ${t.name}`);
   t.after(() => {
-    for (const connection of stores) connection.close();
+    phase(`fixture closing ${stores.size} connection(s): ${t.name}`);
+    for (const connection of stores) {
+      connection.close();
+      phase(`fixture connection closed: ${t.name}`);
+    }
+    phase(`fixture removing directory: ${t.name}`);
     rmSync(directory, { recursive: true, force: true });
+    phase(`fixture cleanup complete: ${t.name}`);
   });
   return {
     store,
@@ -246,20 +267,26 @@ test('tokens are hashed at rest and absent from snapshots, audit events, and por
   const f = fixture(t);
   const owned = claim(f.store, task(f.store, project(f.store).id));
   const raw = new DatabaseSync(f.dbPath);
-  t.after(() => raw.close());
-  const row = raw
-    .prepare('SELECT token_hash, data FROM attempts WHERE id=?')
-    .get(owned.attempt.id)!;
-  assert.equal(row.token_hash, createHash('sha256').update(owned.token).digest('hex'));
-  assert.ok(!String(row.data).includes(owned.token));
-  assert.ok(!JSON.stringify(f.store.snapshot()).includes(owned.token));
-  assert.ok(!JSON.stringify(f.store.exportData()).includes(owned.token));
-  assert.ok(!JSON.stringify(f.store.exportData()).includes('token_hash'));
-  submit(f.store, owned);
-  assert.equal(
-    raw.prepare('SELECT token_hash FROM attempts WHERE id=?').get(owned.attempt.id)!.token_hash,
-    null,
-  );
+  try {
+    const row = raw
+      .prepare('SELECT token_hash, data FROM attempts WHERE id=?')
+      .get(owned.attempt.id)!;
+    assert.equal(row.token_hash, createHash('sha256').update(owned.token).digest('hex'));
+    assert.ok(!String(row.data).includes(owned.token));
+    assert.ok(!JSON.stringify(f.store.snapshot()).includes(owned.token));
+    assert.ok(!JSON.stringify(f.store.exportData()).includes(owned.token));
+    assert.ok(!JSON.stringify(f.store.exportData()).includes('token_hash'));
+    submit(f.store, owned);
+    assert.equal(
+      raw.prepare('SELECT token_hash FROM attempts WHERE id=?').get(owned.attempt.id)!.token_hash,
+      null,
+    );
+  } finally {
+    // Close the raw handle before fixture cleanup removes the Windows directory.
+    phase('token test closing raw connection');
+    raw.close();
+    phase('token test raw connection closed');
+  }
 });
 
 test('dependencies gate claims, completion needs evidence and human acceptance, and done is stable', (t) => {
@@ -444,13 +471,19 @@ test('event insertion failure rolls back task status, version, attempt, and owne
   const initial = task(f.store, project(f.store).id);
   const before = f.store.snapshot();
   const raw = new DatabaseSync(f.dbPath);
+  phase('rollback test installing injected failure trigger');
   raw.exec(
     "CREATE TRIGGER force_audit_failure BEFORE INSERT ON events WHEN NEW.type = 'task.claim' BEGIN SELECT RAISE(ABORT, 'Injected audit failure'); END",
   );
+  phase('rollback test executing claim with injected failure');
   assert.throws(() => claim(f.store, initial), /Injected audit failure/);
+  phase('rollback test claim failure caught; reading snapshot');
   assert.deepEqual(f.store.snapshot(), before);
+  phase('rollback test dropping injected trigger');
   raw.exec('DROP TRIGGER force_audit_failure');
+  phase('rollback test closing raw connection');
   raw.close();
+  phase('rollback test retrying claim after rollback');
   assert.equal(claim(f.store, initial).attempt.number, 1);
 });
 
@@ -458,14 +491,20 @@ test('audit rows are append-only and schema versions newer than supported are re
   const f = fixture(t);
   project(f.store);
   const raw = new DatabaseSync(f.dbPath);
+  phase('audit test executing rejected UPDATE');
   assert.throws(() => raw.exec("UPDATE events SET type='tampered'"), /append-only/);
+  phase('audit test executing rejected DELETE');
   assert.throws(() => raw.exec('DELETE FROM events'), /append-only/);
+  phase('audit test closing raw connection');
   raw.close();
+  phase('audit test creating future schema');
   const futurePath = join(f.directory, 'future.sqlite');
   const future = new DatabaseSync(futurePath);
   future.exec('PRAGMA user_version = 999');
   future.close();
+  phase('audit test opening rejected future schema');
   assert.throws(() => new Store(futurePath), error('SCHEMA_TOO_NEW'));
+  phase('audit test future schema rejection caught');
 });
 
 test('backup round-trip preserves data and audit history, invalidates active leases, and refuses overwrite', (t) => {
@@ -478,7 +517,9 @@ test('backup round-trip preserves data and audit history, invalidates active lea
   );
   const active = claim(source.store, task(source.store, p.id, { dependencies: [completed.id] }));
   const backup = source.store.exportData();
+  phase('backup round-trip restoring into empty target');
   const snapshot = target.store.restoreData(JSON.parse(JSON.stringify(backup)));
+  phase('backup round-trip restored; checking graph');
   assert.deepEqual(snapshot.projects, backup.data.projects);
   const restored = snapshot.tasks.find((value) => value.id === active.task.id)!;
   assert.equal(restored.status, 'ready');
@@ -496,7 +537,9 @@ test('backup round-trip preserves data and audit history, invalidates active lea
     () => target.store.execute('task.heartbeat', credentials(active)),
     error('STALE_ATTEMPT'),
   );
+  phase('backup round-trip rejecting overwrite');
   assert.throws(() => target.store.restoreData(backup), error('DATABASE_NOT_EMPTY'));
+  phase('backup round-trip overwrite rejected');
   assert.equal(
     backup.data.tasks.find((value) => value.id === active.task.id)!.status,
     'running',
@@ -513,17 +556,22 @@ test('malformed backup graphs, review state, unknown fields, and secret-bearing 
   const backup = source.store.exportData();
   const invalid = structuredClone(backup);
   invalid.data.tasks[0].dependencies = [invalid.data.tasks[1].id];
+  phase('invalid backup rejecting cycle');
   assert.throws(() => target.store.restoreData(invalid), error('INVALID_BACKUP'));
   const secrets = structuredClone(backup);
   secrets.data.events[0].data = { nested: { token: 'secret' } };
+  phase('invalid backup rejecting secret field');
   assert.throws(() => target.store.restoreData(secrets), error('INVALID_BACKUP'));
+  phase('invalid backup rejecting unknown field');
   assert.throws(
     () => target.store.restoreData({ ...backup, token: 'unexpected' }),
     error('VALIDATION_ERROR'),
   );
   const badState = structuredClone(backup);
   badState.data.tasks[0].status = 'done';
+  phase('invalid backup rejecting inconsistent state');
   assert.throws(() => target.store.restoreData(badState), error('INVALID_BACKUP'));
+  phase('invalid backup errors caught; checking empty target');
   assert.equal(target.store.snapshot().projects.length, 0);
   assert.equal(target.store.snapshot().events.length, 0);
 });
