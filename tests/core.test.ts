@@ -1,12 +1,10 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test, type TestContext } from 'node:test';
-import { promisify } from 'node:util';
 import { DomainError, Store } from '../src/core/store.js';
 import type { Actor, Attempt, ClaimResult, Handoff, Project, Task } from '../src/shared/types.js';
 
@@ -165,55 +163,6 @@ test('claim is exclusive across Store connections with optimistic version checks
       }),
     error('INVALID_STATE'),
   );
-});
-
-test('simultaneous independent processes cannot double-claim one task', async (t) => {
-  const f = fixture(t);
-  const value = task(f.store, project(f.store).id);
-  const input = { taskId: value.id, expectedVersion: value.version, agent };
-  const module = new URL('../src/core/store.ts', import.meta.url).href;
-  const script = `import {Store} from ${JSON.stringify(module)};const store=new Store(${JSON.stringify(f.dbPath)});try{const result=store.execute('task.claim',${JSON.stringify(input)});process.stdout.write(JSON.stringify({ok:true,id:result.attempt.id}));}catch(error){process.stdout.write(JSON.stringify({ok:false,code:error.code}));}finally{store.close();}`;
-  const settled = await Promise.allSettled(
-    Array.from({ length: 4 }, async () => {
-      const result = await promisify(execFile)(
-        process.execPath,
-        ['--import', 'tsx', '--input-type=module', '-e', script],
-        { timeout: 15000 },
-      );
-      return JSON.parse(result.stdout) as { ok: boolean; code?: string };
-    }),
-  );
-  // Wait for every child before fixture cleanup, including when one fails.
-  // Windows cannot remove a database directory while a peer still owns it.
-  const failures = settled.filter((result) => result.status === 'rejected');
-  assert.equal(
-    failures.length,
-    0,
-    failures
-      .map((result) => {
-        const failure = result.reason as Error & {
-          code?: number;
-          signal?: string;
-          stderr?: string;
-        };
-        return JSON.stringify({
-          message: failure.message,
-          exitCode: failure.code,
-          signal: failure.signal,
-          stderr: failure.stderr,
-        });
-      })
-      .join('\n'),
-  );
-  const results = settled.flatMap((result) =>
-    result.status === 'fulfilled' ? [result.value] : [],
-  );
-  assert.equal(results.filter((result) => result.ok).length, 1);
-  assert.deepEqual(
-    results.filter((result) => !result.ok).map((result) => result.code),
-    ['VERSION_CONFLICT', 'VERSION_CONFLICT', 'VERSION_CONFLICT'],
-  );
-  assert.equal(f.store.snapshot().attempts.length, 1);
 });
 
 test('heartbeat extends only the current lease without changing the task version', (t) => {

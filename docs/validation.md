@@ -90,6 +90,8 @@ CI 配置为 `ubuntu-latest` 与 `windows-latest`，两者使用 Node 24 并执�
 
 `npm test` 对每个测试文件分别启动一个 OS 进程，并在进程内使用 `--test-isolation=none`。文件之间的全局变量仍然隔离，四进程争抢任务、双 MCP 进程和 daemon 重启测试保持原样；不会跳过测试，也不会把失败重试成成功。
 
-此入口避开 Node 24 在 Windows 上已报告的测试运行器子进程 / IPC 退出问题（[Node issue #65756](https://github.com/nodejs/node/issues/65756)）。首次 Windows CI 曾出现只有文件级 `test failed`、没有 JavaScript 堆栈的退出；现有日志不足以确认它与上游问题同源，因此仍需以修订后的 Windows CI 结果为准。启动器会输出原始退出码、十六进制状态和信号，保留进一步诊断依据。
+此入口用于诊断 Node 24 在 Windows 上已报告的测试运行器子进程 / IPC 退出问题（[Node issue #65756](https://github.com/nodejs/node/issues/65756)）。首次 Windows CI 曾出现只有文件级 `test failed`、没有 JavaScript 堆栈的退出；现有日志不足以确认它与上游问题同源，因此仍需以修订后的 Windows CI 结果为准。启动器会输出原始退出码、十六进制状态和信号，保留进一步诊断依据。
 
 若需对照 Node 默认测试隔离模式，可运行 `npm run test:node-runner`。两条入口均运行完整测试集；默认入口采用 TAP 输出，避免简略 reporter 隐藏退出状态。
+
+后续诊断确认本项目的崩溃状态为 `0xc0000409`，在关闭测试运行器内部隔离后仍出现，故不能归因于上述上游 issue。四进程领取用例已单独隔离，使用独立 worker 文件与同步起跑屏障，保留 Unicode 路径、四个独立 SQLite 连接和唯一成功者检查，并记录阶段以区分进程启动、数据库打开、领取与清理。
