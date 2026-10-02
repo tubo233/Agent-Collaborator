@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+.env
+.env.*
+!.env.example
+.agent-collaborator/
+playwright-report/
+test-results/
+*.log
